@@ -33,6 +33,7 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 YOUR_TELEGRAM_ID = int(os.getenv("YOUR_TELEGRAM_ID", "0"))
 PARSE_INTERVAL_MINUTES = int(os.getenv("PARSE_INTERVAL_MINUTES", "15"))
+KWORK_COOKIES = os.getenv("KWORK_COOKIES", "")  # необязательно: cookies сессии kwork.ru
 
 DB_PATH = "db.sqlite3"
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
@@ -173,10 +174,21 @@ async def get_stats() -> dict:
 # [PARSER]
 # ============================================================
 
+# Категории для API kwork.ru (числовые ID совпадают с ?c= параметром)
+KWORK_API_URL = "https://kwork.ru/projects/api/v2/wants"
+
 async def fetch_page(url: str, client: httpx.AsyncClient) -> str | None:
-    headers = {"User-Agent": random.choice(USER_AGENTS)}
+    """HTTP GET с ротацией User-Agent. Возвращает текст ответа или None."""
+    headers = {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+        "Referer": "https://kwork.ru/",
+    }
+    if KWORK_COOKIES:
+        headers["Cookie"] = KWORK_COOKIES
     try:
-        response = await client.get(url, headers=headers, timeout=20, follow_redirects=True)
+        response = await client.get(url, headers=headers, timeout=25, follow_redirects=True)
         if response.status_code == 200:
             return response.text
         elif response.status_code in (403, 429):
@@ -191,58 +203,190 @@ async def fetch_page(url: str, client: httpx.AsyncClient) -> str | None:
         return None
 
 
-def parse_cards(html: str, category_name: str) -> list[dict]:
-    """Парсинг карточек заказов из HTML страницы kwork.ru"""
-    soup = BeautifulSoup(html, "lxml")
-    cards = []
+async def fetch_api(category_id: str, client: httpx.AsyncClient) -> list[dict]:
+    """
+    Пробуем получить заказы через внутренний JSON API kwork.ru.
+    Возвращает список сырых объектов заказов или [] при ошибке.
+    """
+    headers = {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "application/json, text/plain, */*",
+        "Referer": f"https://kwork.ru/projects?c={category_id}",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    if KWORK_COOKIES:
+        headers["Cookie"] = KWORK_COOKIES
+    params = {"c": category_id, "page": 1}
+    try:
+        response = await client.get(
+            KWORK_API_URL, headers=headers, params=params, timeout=25, follow_redirects=True
+        )
+        if response.status_code == 200:
+            data = response.json()
+            # Структура ответа: {"success": true, "data": {"wants": [...]}}
+            wants = (
+                data.get("data", {}).get("wants")
+                or data.get("wants")
+                or []
+            )
+            logger.info(f"API вернул {len(wants)} заказов для категории {category_id}")
+            return wants
+        else:
+            logger.debug(f"API статус {response.status_code} для категории {category_id}")
+            return []
+    except Exception as e:
+        logger.debug(f"Ошибка API для категории {category_id}: {e}")
+        return []
 
-    # kwork.ru использует карточки с классом want-card или подобным
-    # Пробуем несколько селекторов под возможную разметку
+
+def normalize_api_order(raw: dict, category_name: str) -> dict | None:
+    """Преобразует сырой объект из API kwork.ru в наш формат."""
+    try:
+        kwork_id = str(raw.get("id", ""))
+        if not kwork_id:
+            return None
+
+        title = raw.get("name") or raw.get("title") or "Без названия"
+        description = raw.get("description") or raw.get("desc") or ""
+        # Бюджет может быть в разных полях
+        budget_val = raw.get("priceLimit") or raw.get("price") or raw.get("budget") or ""
+        budget = f"{budget_val} ₽" if budget_val else "Не указан"
+        # Дедлайн
+        deadline = raw.get("dateEnd") or raw.get("deadline") or "Не указан"
+
+        url = raw.get("url") or f"https://kwork.ru/projects/{kwork_id}/"
+        if not url.startswith("http"):
+            url = f"https://kwork.ru{url}"
+
+        return {
+            "kwork_id": kwork_id,
+            "title": str(title).strip(),
+            "description": str(description).strip()[:1000],
+            "budget": str(budget).strip(),
+            "deadline": str(deadline).strip(),
+            "category": category_name,
+            "url": url,
+        }
+    except Exception as e:
+        logger.debug(f"Ошибка нормализации заказа: {e}")
+        return None
+
+
+def parse_cards_from_html(html: str, category_name: str) -> list[dict]:
+    """
+    HTML-парсер с диагностическим логированием.
+    Перебирает известные классы разметки kwork.ru.
+    """
+    soup = BeautifulSoup(html, "lxml")
+
+    # --- Диагностика: показываем что реально есть в HTML ---
+    all_divs_with_data_id = soup.find_all(attrs={"data-id": True})
+    project_links = soup.find_all("a", href=re.compile(r"/projects/\d+"))
+    logger.debug(
+        f"HTML-диагностика: data-id элементов={len(all_divs_with_data_id)}, "
+        f"ссылок на /projects/={{len(project_links)}}"
+    )
+
+    # Расширенный список известных классов карточек kwork.ru
     card_selectors = [
+        # Актуальные классы (2024-2025)
         "div.want-card",
-        "article.project-card",
-        "div[data-id]",
-        "div.card",
+        "div.wants-card",
+        "div.project-card",
+        "li.want-card",
+        "li.project-card",
+        # По data-атрибутам
+        "div[data-id][data-want-id]",
+        "div[data-want-id]",
+        "[data-id][class*='want']",
+        "[data-id][class*='project']",
+        # Общие контейнеры
+        "article[class*='card']",
+        "div[class*='want-card']",
+        "div[class*='project']",
     ]
 
     project_cards = []
+    matched_selector = None
     for selector in card_selectors:
-        project_cards = soup.select(selector)
-        if project_cards:
-            break
+        try:
+            found = soup.select(selector)
+            if found:
+                project_cards = found
+                matched_selector = selector
+                break
+        except Exception:
+            continue
 
-    # Fallback: ищем ссылки на /projects/ в HTML
-    if not project_cards:
-        return parse_cards_fallback(soup, category_name)
+    if matched_selector:
+        logger.debug(f"Сработал селектор: '{matched_selector}', карточек: {len(project_cards)}")
+    else:
+        logger.debug("CSS-селекторы не сработали, использую ссылочный fallback.")
+        return parse_cards_link_fallback(soup, category_name, project_links)
 
+    cards = []
     for card in project_cards:
         try:
-            # ID заказа
-            kwork_id = card.get("data-id") or card.get("id", "")
+            # ID
+            kwork_id = (
+                card.get("data-want-id")
+                or card.get("data-id")
+                or card.get("id", "")
+            )
             if not kwork_id:
                 link = card.find("a", href=re.compile(r"/projects/\d+"))
                 if link:
                     m = re.search(r"/projects/(\d+)", link["href"])
                     kwork_id = m.group(1) if m else ""
-
             if not kwork_id:
                 continue
 
-            # Заголовок
-            title_el = card.find(["h2", "h3", "a"], class_=re.compile(r"title|name|heading", re.I))
-            title = title_el.get_text(strip=True) if title_el else "Без названия"
+            # Заголовок — ищем первый <a> или заголовочный тег внутри карточки
+            title = ""
+            for title_sel in [
+                "[class*='title']", "[class*='name']", "[class*='heading']",
+                "h2", "h3", "h4",
+            ]:
+                el = card.select_one(title_sel)
+                if el:
+                    title = el.get_text(strip=True)
+                    break
+            if not title:
+                link_el = card.find("a", href=re.compile(r"/projects/\d+"))
+                title = link_el.get_text(strip=True) if link_el else "Без названия"
 
             # Описание
-            desc_el = card.find(["p", "div"], class_=re.compile(r"desc|text|body|content", re.I))
-            description = desc_el.get_text(strip=True) if desc_el else ""
+            description = ""
+            for desc_sel in [
+                "[class*='desc']", "[class*='text']",
+                "[class*='body']", "[class*='content']", "p",
+            ]:
+                el = card.select_one(desc_sel)
+                if el:
+                    description = el.get_text(strip=True)
+                    break
 
             # Бюджет
-            budget_el = card.find(["span", "div"], class_=re.compile(r"price|budget|cost|money", re.I))
-            budget = budget_el.get_text(strip=True) if budget_el else "Не указан"
+            budget = "Не указан"
+            for price_sel in [
+                "[class*='price']", "[class*='budget']",
+                "[class*='cost']", "[class*='money']", "[class*='pay']",
+            ]:
+                el = card.select_one(price_sel)
+                if el:
+                    budget = el.get_text(strip=True)
+                    break
 
             # Дедлайн
-            deadline_el = card.find(["span", "div"], class_=re.compile(r"deadline|date|time", re.I))
-            deadline = deadline_el.get_text(strip=True) if deadline_el else "Не указан"
+            deadline = "Не указан"
+            for dl_sel in [
+                "[class*='deadline']", "[class*='date']",
+                "[class*='time']", "[class*='period']",
+            ]:
+                el = card.select_one(dl_sel)
+                if el:
+                    deadline = el.get_text(strip=True)
+                    break
 
             # URL
             link_el = card.find("a", href=re.compile(r"/projects/\d+"))
@@ -254,7 +398,7 @@ def parse_cards(html: str, category_name: str) -> list[dict]:
 
             cards.append({
                 "kwork_id": str(kwork_id),
-                "title": title,
+                "title": title[:300],
                 "description": description[:1000],
                 "budget": budget,
                 "deadline": deadline,
@@ -268,13 +412,26 @@ def parse_cards(html: str, category_name: str) -> list[dict]:
     return cards
 
 
-def parse_cards_fallback(soup: BeautifulSoup, category_name: str) -> list[dict]:
-    """Резервный парсер: ищет все ссылки на проекты"""
+def parse_cards_link_fallback(
+    soup: BeautifulSoup,
+    category_name: str,
+    project_links: list | None = None,
+) -> list[dict]:
+    """
+    Финальный резервный парсер: находит заказы по ссылкам /projects/{id}/.
+    Работает даже при полностью изменённой разметке.
+    """
     cards = []
-    seen_ids = set()
+    seen_ids: set[str] = set()
 
-    for link in soup.find_all("a", href=re.compile(r"/projects/\d+")):
-        m = re.search(r"/projects/(\d+)", link["href"])
+    if project_links is None:
+        project_links = soup.find_all("a", href=re.compile(r"/projects/\d+"))
+
+    logger.debug(f"Ссылочный fallback: найдено {len(project_links)} ссылок на проекты")
+
+    for link in project_links:
+        href = link.get("href", "")
+        m = re.search(r"/projects/(\d+)", href)
         if not m:
             continue
 
@@ -283,28 +440,88 @@ def parse_cards_fallback(soup: BeautifulSoup, category_name: str) -> list[dict]:
             continue
         seen_ids.add(kwork_id)
 
-        title = link.get_text(strip=True) or "Без названия"
-        parent = link.find_parent(["div", "article", "li"])
+        # Пробуем получить заголовок из текста ссылки
+        title = link.get_text(strip=True)
+        # Если ссылка — это просто иконка или кнопка без текста — ищем родителя
+        if not title or len(title) < 5:
+            parent = link.find_parent(["article", "li", "div"])
+            if parent:
+                # Ищем первый содержательный текст
+                for child in parent.descendants:
+                    if hasattr(child, "get_text"):
+                        txt = child.get_text(strip=True)
+                        if len(txt) > 10:
+                            title = txt
+                            break
+        if not title:
+            title = "Без названия"
+
+        # Описание из ближайшего родительского блока
         description = ""
         budget = "Не указан"
         deadline = "Не указан"
-
+        parent = link.find_parent(["article", "li", "div"])
         if parent:
-            texts = [t.strip() for t in parent.stripped_strings if t.strip()]
-            description = " ".join(texts[:5])[:800]
+            texts = [t.strip() for t in parent.stripped_strings if len(t.strip()) > 3]
+            # Исключаем сам заголовок из описания
+            desc_parts = [t for t in texts if t != title][:8]
+            description = " ".join(desc_parts)[:800]
 
-        href = link["href"]
+            # Грубый поиск бюджета — ищем числа с ₽ или руб
+            budget_match = re.search(r"(\d[\d\s]*(?:₽|руб))", parent.get_text())
+            if budget_match:
+                budget = budget_match.group(1).strip()
+
         url = href if href.startswith("http") else f"https://kwork.ru{href}"
 
         cards.append({
             "kwork_id": kwork_id,
-            "title": title,
+            "title": title[:300],
             "description": description,
             "budget": budget,
             "deadline": deadline,
             "category": category_name,
             "url": url,
         })
+
+    return cards
+
+
+async def fetch_category(category: dict, client: httpx.AsyncClient) -> list[dict]:
+    """
+    Основная функция получения заказов по одной категории.
+    Стратегия: сначала пробуем JSON API, при неудаче — HTML-парсинг.
+    """
+    cat_id = category["url"].split("c=")[-1]
+    cat_name = category["name"]
+
+    # Стратегия 1: JSON API
+    raw_orders = await fetch_api(cat_id, client)
+    if raw_orders:
+        cards = []
+        for raw in raw_orders:
+            card = normalize_api_order(raw, cat_name)
+            if card:
+                cards.append(card)
+        if cards:
+            return cards
+
+    # Стратегия 2: HTML-парсинг
+    html = await fetch_page(category["url"], client)
+    if not html:
+        return []
+
+    # Диагностика: логируем размер HTML и первые видимые классы
+    logger.debug(f"HTML размер: {len(html)} байт")
+
+    cards = parse_cards_from_html(html, cat_name)
+
+    # Если ничего не нашли — сохраняем фрагмент HTML для отладки
+    if not cards:
+        snippet = html[:2000].replace("\n", " ")
+        logger.warning(
+            f"[{cat_name}] 0 карточек. Начало HTML: {snippet[:500]}..."
+        )
 
     return cards
 
@@ -321,11 +538,7 @@ async def parse_kwork():
 
     async with httpx.AsyncClient() as client:
         for category in KWORK_CATEGORIES:
-            html = await fetch_page(category["url"], client)
-            if not html:
-                continue
-
-            cards = parse_cards(html, category["name"])
+            cards = await fetch_category(category, client)
             logger.info(f"Категория '{category['name']}': найдено {len(cards)} карточек.")
 
             for card in cards:
@@ -491,7 +704,8 @@ async def cmd_start(message: Message):
         "/status — текущий статус мониторинга\n"
         "/stats — статистика за 24 часа\n"
         "/pause — приостановить мониторинг\n"
-        "/resume — возобновить мониторинг"
+        "/resume — возобновить мониторинг\n"
+        "/debug — диагностика парсера"
     ).format(interval=PARSE_INTERVAL_MINUTES)
     await message.answer(text, parse_mode="HTML")
 
@@ -542,6 +756,67 @@ async def cmd_resume(message: Message):
         return
     monitoring_paused = False
     await message.answer("▶️ Мониторинг <b>возобновлён</b>!", parse_mode="HTML")
+
+
+@dp.message(Command("debug"))
+async def cmd_debug(message: Message):
+    """Диагностический запрос к kwork.ru — показывает что реально находит парсер."""
+    if message.from_user.id != YOUR_TELEGRAM_ID:
+        return
+
+    await message.answer("🔍 <i>Запускаю диагностику парсера...</i>", parse_mode="HTML")
+
+    # Берём первую категорию для теста
+    category = KWORK_CATEGORIES[0]
+    cat_id = category["url"].split("c=")[-1]
+
+    async with httpx.AsyncClient() as client:
+        # Тест JSON API
+        raw_orders = await fetch_api(cat_id, client)
+        api_count = len(raw_orders)
+
+        # Тест HTML
+        html = await fetch_page(category["url"], client)
+        html_size = len(html) if html else 0
+        html_cards = parse_cards_from_html(html, category["name"]) if html else []
+
+        # Ищем любые ссылки на /projects/ в HTML
+        project_links_count = 0
+        has_auth_redirect = False
+        if html:
+            soup = BeautifulSoup(html, "lxml")
+            project_links_count = len(soup.find_all("a", href=re.compile(r"/projects/\d+")))
+            # Проверка на редирект авторизации
+            has_auth_redirect = bool(
+                soup.find("form", action=re.compile(r"login|auth", re.I))
+                or "войдите" in html.lower()
+                or "авторизуйтесь" in html.lower()
+                or re.search(r"/login|/auth|sign.in", html.lower())
+            )
+
+    lines = [
+        f"🔎 <b>Диагностика парсера</b>",
+        f"Категория: <code>{category['name']}</code>",
+        "",
+        f"<b>JSON API:</b> {api_count} заказов",
+        f"<b>HTML размер:</b> {html_size:,} байт",
+        f"<b>HTML карточек:</b> {len(html_cards)}",
+        f"<b>Ссылок /projects/:</b> {project_links_count}",
+        f"<b>Стена авторизации:</b> {'⚠️ ДА' if has_auth_redirect else '✅ НЕТ'}",
+    ]
+
+    if api_count == 0 and html_cards == 0 and project_links_count == 0:
+        lines += [
+            "",
+            "⚠️ <b>Вероятная причина:</b> kwork.ru требует авторизацию "
+            "или рендерит контент через JavaScript (SPA). "
+            "Обычный HTTP-парсер не может получить карточки.",
+            "",
+            "💡 <b>Решение:</b> добавить cookies авторизованной сессии "
+            "в заголовки запросов (см. README).",
+        ]
+
+    await message.answer("\n".join(lines), parse_mode="HTML")
 
 
 @dp.callback_query(F.data.startswith("generate_response:"))
